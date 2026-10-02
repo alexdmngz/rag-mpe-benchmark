@@ -19,8 +19,9 @@ def load_data(path):
         answers = item.get("answers")
         if not isinstance(answers, dict) or set(answers) != set("ABCD"):
             raise ValueError(f"Question {number}: answers must have keys A, B, C, D.")
-        if any(not isinstance(value, str) or not value.strip() for value in answers.values()):
-            raise ValueError(f"Question {number}: an answer is empty.")
+        for answer in answers.values():
+            if not isinstance(answer, str) or not answer.strip():
+                raise ValueError(f"Question {number}: an answer is empty.")
         if item["correct_answer"] not in answers:
             raise ValueError(f"Question {number}: invalid correct_answer.")
         question = item["question"].strip()
@@ -35,25 +36,30 @@ def remove_block_between(text, start_marker, end_marker):
     if start == -1:
         return text
     end = text.find(end_marker, start)
-    return text[:start] + (text[end:] if end != -1 else "")
+    if end == -1:
+        return text[:start]
+    return text[:start] + text[end:]
 
 
 def clean_paper_text(text):
     """Preserve the original paragraph cleaning and reference-removal heuristic."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = remove_block_between(text, "References", "Appendix")
-    paragraphs, current = [], ""
+    paragraphs = []
+    current = ""
     for line in text.split("\n"):
         line = line.strip()
         if not line:
             if current and current.endswith((".", "?", "!")) and not current.endswith("et al."):
                 paragraphs.append(current)
                 current = ""
-        elif not re.fullmatch(r"\d+(\.\d+)?", line):
-            if current.endswith("-"):
-                current = current[:-1] + line
-            else:
-                current = (current + " " + line).strip()
+            continue
+        if re.fullmatch(r"\d+(\.\d+)?", line):
+            continue  # Skip page numbers and numeric section headings.
+        if current.endswith("-"):
+            current = current[:-1] + line
+        else:
+            current = (current + " " + line).strip()
     if current:
         paragraphs.append(current)
     return "\n\n".join(paragraphs)
@@ -67,30 +73,45 @@ def recursive_chunker(text, max_size=250, overlap=30):
     """Pack paragraphs/sentences, splitting long spans by words when necessary."""
     if max_size <= 0 or not 0 <= overlap < max_size:
         raise ValueError("Require max_size > 0 and 0 <= overlap < max_size.")
-    chunks, current = [], []
+    chunks = []
+    current = []
     for paragraph in text.split("\n\n"):
-        units = [paragraph] if count_words(paragraph) <= max_size else re.split(r"(?<=[.?!])\s+", paragraph)
+        # Keep a paragraph together when it fits; otherwise try sentences.
+        if count_words(paragraph) <= max_size:
+            units = [paragraph]
+        else:
+            units = re.split(r"(?<=[.?!])\s+", paragraph)
         for unit in units:
             words = unit.split()
             if not words:
                 continue
             if current and len(current) + len(words) > max_size:
                 chunks.append(" ".join(current))
-                current = current[-overlap:] if overlap else []
+                current = last_words(current, overlap)
+            # A long sentence may still need to be split across chunks.
             while len(current) + len(words) > max_size:
                 capacity = max_size - len(current)
                 current.extend(words[:capacity])
                 words = words[capacity:]
                 chunks.append(" ".join(current))
-                current = current[-overlap:] if overlap else []
+                current = last_words(current, overlap)
             current.extend(words)
     if current:
         chunks.append(" ".join(current))
     return chunks
 
 
+def last_words(words, overlap):
+    # words[-0:] would keep the entire list, so zero needs its own case.
+    if overlap == 0:
+        return []
+    return words[-overlap:]
+
+
 def normalize_text_for_match(text):
-    return " ".join(re.sub(r"[^a-z0-9\s]", " ", (text or "").lower()).split())
+    text = (text or "").lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return " ".join(text.split())
 
 
 def better_tokenize(text):
@@ -100,10 +121,14 @@ def better_tokenize(text):
 def normalize_scores(scores):
     if len(scores) == 0:
         return []
-    minimum, maximum = min(scores), max(scores)
+    minimum = min(scores)
+    maximum = max(scores)
     if maximum == minimum:
         return [1.0] * len(scores)
-    return [(score - minimum) / (maximum - minimum) for score in scores]
+    normalized = []
+    for score in scores:
+        normalized.append((score - minimum) / (maximum - minimum))
+    return normalized
 
 
 def parse_mc_answer(text_response):
@@ -112,22 +137,35 @@ def parse_mc_answer(text_response):
     match = re.search(r"^\s*Answer:\s*([A-D]|N/A)[.)]?\s*$", text, re.IGNORECASE | re.MULTILINE)
     if match:
         return match.group(1).upper()
-    return text.upper() if text.upper() in (*"ABCD", "N/A") else "N/A"
+    answer = text.upper()
+    if answer in ("A", "B", "C", "D", "N/A"):
+        return answer
+    return "N/A"
 
 
 def compute_accuracy(model_answers, true_answers):
     if len(model_answers) != len(true_answers):
         raise ValueError("Predictions and labels must have equal lengths.")
-    mistakes = [i + 1 for i, (pred, label) in enumerate(zip(model_answers, true_answers)) if pred != label]
+    mistakes = []
+    for index in range(len(true_answers)):
+        if model_answers[index] != true_answers[index]:
+            mistakes.append(index + 1)
     total = len(true_answers)
     correct = total - len(mistakes)
-    return (100 * correct / total if total else 0.0), correct, total, mistakes
+    accuracy = 0.0
+    if total > 0:
+        accuracy = 100 * correct / total
+    return accuracy, correct, total, mistakes
 
 
 def check_fuzzy_attribution(retrieved_context, reference, threshold=0.75):
-    ref_tokens = better_tokenize(reference)
-    ctx_tokens = set(better_tokenize(retrieved_context))
-    if not ref_tokens or not ctx_tokens:
+    reference_words = better_tokenize(reference)
+    context_words = set(better_tokenize(retrieved_context))
+    if not reference_words or not context_words:
         return False, 0.0
-    score = sum(token in ctx_tokens for token in ref_tokens) / len(ref_tokens)
+    matches = 0
+    for word in reference_words:
+        if word in context_words:
+            matches += 1
+    score = matches / len(reference_words)
     return score >= threshold, score

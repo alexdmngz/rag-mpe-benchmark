@@ -9,7 +9,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from core import better_tokenize, check_fuzzy_attribution, compute_accuracy, normalize_scores, parse_mc_answer
+from core import (
+    better_tokenize,
+    check_fuzzy_attribution,
+    compute_accuracy,
+    normalize_scores,
+    parse_mc_answer,
+)
 
 METHODS = ("bm25", "dense", "hybrid")
 
@@ -32,25 +38,65 @@ class Retriever:
         if method == "bm25":
             return self.bm25.get_top_n(tokens, self.chunks, n=top_k)
 
-        pool = dense_pool if method == "dense" else hybrid_dense_pool
-        result = self.collection.query(query_texts=[question], n_results=min(pool, len(self.chunks)))
+        if method == "dense":
+            pool = dense_pool
+        else:
+            pool = hybrid_dense_pool
+        result = self.collection.query(
+            query_texts=[question], n_results=min(pool, len(self.chunks))
+        )
         candidates = result["documents"][0]
         if method == "hybrid":
-            dense_scores = normalize_scores([1 - distance for distance in result["distances"][0]])
-            scores = {int(idx): self.alpha * score for idx, score in zip(result["ids"][0], dense_scores)}
-            bm25_scores = self.bm25.get_scores(tokens)
-            bm25_ids = np.argsort(bm25_scores)[::-1][:50]
-            for idx, score in zip(bm25_ids, normalize_scores([bm25_scores[i] for i in bm25_ids])):
-                scores[idx] = scores.get(idx, 0) + (1 - self.alpha) * score
-            ordered = sorted(scores, key=scores.get, reverse=True)
+            candidates = self.combine_scores(tokens, result)
             if rerank:
-                ordered = ordered[:hybrid_pool]
-            candidates = [self.chunks[idx] for idx in ordered]
+                candidates = candidates[:hybrid_pool]
 
         if rerank and candidates:
-            scores = self.reranker.predict([[question, chunk] for chunk in candidates])
-            candidates = [candidates[idx] for idx in np.argsort(scores)[::-1]]
+            candidates = self.rerank_candidates(question, candidates)
         return candidates[:top_k]
+
+    def combine_scores(self, tokens, dense_result):
+        """Add the weighted dense and BM25 scores for each chunk."""
+        # Chroma returns distances: smaller distances mean better matches.
+        similarities = []
+        for distance in dense_result["distances"][0]:
+            similarities.append(1 - distance)
+        dense_scores = normalize_scores(similarities)
+
+        combined_scores = {}
+        for chunk_id, score in zip(dense_result["ids"][0], dense_scores):
+            combined_scores[int(chunk_id)] = self.alpha * score
+
+        bm25_scores = self.bm25.get_scores(tokens)
+        # argsort gives positions from lowest to highest score; reverse them.
+        bm25_ids = np.argsort(bm25_scores)[::-1][:50]
+        top_scores = []
+        for chunk_id in bm25_ids:
+            top_scores.append(bm25_scores[chunk_id])
+        normalized_bm25 = normalize_scores(top_scores)
+
+        for chunk_id, score in zip(bm25_ids, normalized_bm25):
+            if chunk_id not in combined_scores:
+                combined_scores[chunk_id] = 0
+            combined_scores[chunk_id] += (1 - self.alpha) * score
+
+        ordered_ids = sorted(combined_scores, key=combined_scores.get, reverse=True)
+        candidates = []
+        for chunk_id in ordered_ids:
+            candidates.append(self.chunks[chunk_id])
+        return candidates
+
+    def rerank_candidates(self, question, candidates):
+        pairs = []
+        for chunk in candidates:
+            pairs.append([question, chunk])
+        scores = self.reranker.predict(pairs)
+        ordered_ids = np.argsort(scores)[::-1]
+
+        ranked_chunks = []
+        for chunk_id in ordered_ids:
+            ranked_chunks.append(candidates[chunk_id])
+        return ranked_chunks
 
 
 def build_vector_collection(chunks):
@@ -68,7 +114,8 @@ def build_vector_collection(chunks):
 
 def build_prompt(item, method, context=""):
     """Preserve the study's method-specific prompts, including their formatting."""
-    question, answers = item["question"], item["answers"]
+    question = item["question"]
+    answers = item["answers"]
     if method == "baseline":
         options = "\n".join(f"{letter}){answers[letter]}" for letter in "ABCD")
         return f"""
@@ -99,7 +146,10 @@ Format your answer EXACTLY like this:
    Answer: [Letter A-D]
    Source: [Choose the most important information in the context above]
 '''
-    reasoning = "One sentence explaining the evidence found" if method == "dense" else "Brief explanation"
+    if method == "dense":
+        reasoning = "One sentence explaining the evidence found"
+    else:
+        reasoning = "Brief explanation"
     return f'''
 You are an expert AI researcher analyzing a technical paper.
 
@@ -123,30 +173,37 @@ Answer: [Just the Letter A/B/C/D]
 
 def call_gemini(generate, prompt, max_retries=3, sleep=5):
     """Retry temporary failures; never turn failed API calls into accuracy scores."""
+    if max_retries < 1:
+        raise ValueError("max_retries must be positive")
     for attempt in range(max_retries):
         try:
             text = (generate(prompt) or "").strip()
         except Exception as error:
-            if getattr(error, "code", None) in (400, 401, 403, 404) or attempt + 1 == max_retries:
+            permanent_error = getattr(error, "code", None) in (400, 401, 403, 404)
+            last_attempt = attempt + 1 == max_retries
+            if permanent_error or last_attempt:
                 raise RuntimeError("Gemini request failed; check the model, API key and quota.") from None
             print(f"Gemini request failed ({type(error).__name__}); retrying.")
             time.sleep(sleep * (attempt + 1))
         else:
             time.sleep(sleep)
             return text
-    raise ValueError("max_retries must be positive")
 
 
 def evaluate_accuracy(data, retriever, generate, rounds=1, sleep=5):
     rows = []
     labels = [item["correct_answer"] for item in data]
     for round_number in range(1, rounds + 1):
-        for method in ("baseline", *METHODS):
+        for method in ("baseline", "bm25", "dense", "hybrid"):
             predictions = []
             for item in data:
-                chunks = [] if method == "baseline" else retriever.retrieve(item["question"], method)
-                prompt = build_prompt(item, method, "\n---\n".join(chunks))
-                predictions.append(parse_mc_answer(call_gemini(generate, prompt, sleep=sleep)))
+                context = ""
+                if method != "baseline":
+                    chunks = retriever.retrieve(item["question"], method)
+                    context = "\n---\n".join(chunks)
+                prompt = build_prompt(item, method, context)
+                response = call_gemini(generate, prompt, sleep=sleep)
+                predictions.append(parse_mc_answer(response))
             accuracy, correct, total, mistakes = compute_accuracy(predictions, labels)
             rows.append({"round": round_number, "method": method, "accuracy": accuracy})
             print(f"Round {round_number}, {method}: {correct}/{total} ({accuracy:.2f}%); mistakes: {mistakes}")
@@ -156,7 +213,8 @@ def evaluate_accuracy(data, retriever, generate, rounds=1, sleep=5):
 def evaluate_sources(data, retriever, threshold=0.75):
     rows = []
     for method in METHODS:
-        hits, scores = [], []
+        hits = []
+        scores = []
         for item in data:
             chunks = retriever.retrieve(item["question"], method, top_k=5, dense_pool=20,
                                         hybrid_dense_pool=20, hybrid_pool=15)
@@ -169,35 +227,64 @@ def evaluate_sources(data, retriever, threshold=0.75):
 
 
 def evaluate_recall(data, retriever, threshold=0.75, k_values=(1, 3, 5, 10)):
-    hits = {method: {k: 0 for k in k_values} for method in METHODS}
+    hits = {}
+    for method in METHODS:
+        hits[method] = {}
+        for k in k_values:
+            hits[method][k] = 0
     for item in data:
         for method in METHODS:
             chunks = retriever.retrieve(item["question"], method, top_k=max(k_values),
                                         dense_pool=50, rerank=False)
             for k in k_values:
                 hit, _ = check_fuzzy_attribution(" ".join(chunks[:k]), item["paper_reference"], threshold)
-                hits[method][k] += hit
+                if hit:
+                    hits[method][k] += 1
     rows = []
     for k in k_values:
-        bm25, dense, hybrid = [100 * hits[method][k] / len(data) for method in METHODS]
+        bm25 = 100 * hits["bm25"][k] / len(data)
+        dense = 100 * hits["dense"][k] / len(data)
+        hybrid = 100 * hits["hybrid"][k] / len(data)
+        # Preserve the original tie rule: Hybrid first, then BM25.
+        if hybrid >= max(bm25, dense):
+            winner = "Hybrid"
+        elif dense > bm25:
+            winner = "Dense"
+        else:
+            winner = "BM25"
         rows.append({"Métrica": f"Recall @ {k}", "BM25": f"{bm25:.1f}%", "Dense": f"{dense:.1f}%",
                      "Hybrid": f"{hybrid:.1f}%",
-                     "Ganador": "Hybrid" if hybrid >= max(bm25, dense) else "Dense" if dense > bm25 else "BM25"})
+                     "Ganador": winner})
     return pd.DataFrame(rows)
 
 
 def evaluate_overhead(data, retriever):
-    rows, means = [], []
+    rows = []
+    means = []
     for method in METHODS:
-        top_k = 3 if method == "bm25" else 5
-        contexts = ["\n".join(retriever.retrieve(item["question"], method, top_k=top_k,
-                    hybrid_dense_pool=15, hybrid_pool=15)) for item in data]
-        mean_chars = np.mean([len(context) for context in contexts])
+        if method == "bm25":
+            top_k = 3
+            label = "BM25"
+        else:
+            top_k = 5
+            label = method.title()
+        context_lengths = []
+        for item in data:
+            chunks = retriever.retrieve(
+                item["question"], method, top_k=top_k,
+                hybrid_dense_pool=15, hybrid_pool=15,
+            )
+            context = "\n".join(chunks)
+            context_lengths.append(len(context))
+        mean_chars = np.mean(context_lengths)
         means.append(mean_chars)
-        rows.append({"Pipeline": f"{method.upper() if method == 'bm25' else method.title()} (n={top_k})",
+        rows.append({"Pipeline": f"{label} (n={top_k})",
                      "Avg Caracteres": int(mean_chars), "Est. Tokens": int(mean_chars / 4)})
     for i, row in enumerate(rows):
-        row["Coste Relativo"] = "1.0x (Base)" if i == 0 else f"{means[i] / means[0]:.1f}x"
+        if i == 0:
+            row["Coste Relativo"] = "1.0x (Base)"
+        else:
+            row["Coste Relativo"] = f"{means[i] / means[0]:.1f}x"
     return pd.DataFrame(rows)
 
 

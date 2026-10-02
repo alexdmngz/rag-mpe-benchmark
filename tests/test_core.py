@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from core import (check_fuzzy_attribution, clean_paper_text, compute_accuracy,
-                  load_data, parse_mc_answer, recursive_chunker)
+                  load_data, normalize_scores, parse_mc_answer, recursive_chunker)
 
 
 class CoreTests(unittest.TestCase):
@@ -16,10 +16,18 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(load_data(ROOT / "data/ModelizaciónEmpresaUCMData.json")), 70)
 
     def test_invalid_and_duplicate_records(self):
-        valid = {"question": "Q", "answers": dict(zip("ABCD", "abcd")),
-                 "correct_answer": "A", "paper_reference": "Evidence"}
-        invalid = [[], [None], [valid, valid], [{**valid, "correct_answer": "E"}],
-                   [{**valid, "answers": {"A": "one"}}], [{**valid, "paper_reference": ""}]]
+        valid = {
+            "question": "Q",
+            "answers": {"A": "a", "B": "b", "C": "c", "D": "d"},
+            "correct_answer": "A",
+            "paper_reference": "Evidence",
+        }
+        invalid = [[], [None], [valid, valid]]
+        for field, value in [("correct_answer", "E"), ("answers", {"A": "one"}),
+                             ("paper_reference", "")]:
+            record = valid.copy()
+            record[field] = value
+            invalid.append([record])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "data.json"
             for value in invalid:
@@ -76,6 +84,11 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(check_fuzzy_attribution("a b", "a a b c"), (True, 0.75))
         self.assertEqual(check_fuzzy_attribution("a b", "a a b c", 0.8), (False, 0.75))
         self.assertEqual(check_fuzzy_attribution("", "reference"), (False, 0.0))
+
+    def test_score_normalization(self):
+        self.assertEqual(normalize_scores([]), [])
+        self.assertEqual(normalize_scores([4, 4]), [1.0, 1.0])
+        self.assertEqual(normalize_scores([-2, 0, 2]), [0.0, 0.5, 1.0])
 
     def test_cli_runs_outside_repository_and_refuses_overwrite(self):
         with tempfile.TemporaryDirectory() as directory:
