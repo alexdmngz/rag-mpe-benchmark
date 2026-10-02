@@ -80,7 +80,7 @@ class CoreTests(unittest.TestCase):
     def test_cli_runs_outside_repository_and_refuses_overwrite(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "run"
-            command = [sys.executable, str(ROOT / "src/Script.py"), "--output", str(output)]
+            command = [sys.executable, str(ROOT / "src/main.py"), "--output", str(output)]
             completed = subprocess.run(command, cwd=directory, capture_output=True, text=True)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             metadata = json.loads((output / "run.json").read_text())

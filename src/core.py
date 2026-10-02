@@ -131,7 +131,3 @@ def check_fuzzy_attribution(retrieved_context, reference, threshold=0.75):
         return False, 0.0
     score = sum(token in ctx_tokens for token in ref_tokens) / len(ref_tokens)
     return score >= threshold, score
-
-
-def check_fuzzy_match(retrieved_context, reference, threshold=0.75):
-    return check_fuzzy_attribution(retrieved_context, reference, threshold)[0]

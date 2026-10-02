@@ -116,22 +116,17 @@ def main(argv=None):
             from google import genai
             from sentence_transformers import CrossEncoder
 
-            experiment.OUTPUT_DIR = output
-            experiment.SLEEP_SECONDS = args.sleep
             print(f"Full run: {4 * len(data) * args.rounds} Gemini requests before retries; model={model_name}.")
             chroma_client, collection = experiment.build_vector_collection(chunks)
             reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
             with genai.Client(api_key=api_key) as client:
-                class GeminiModel:
-                    def generate_content(self, prompt):
-                        return client.models.generate_content(
-                            model=model_name, contents=prompt, config={"temperature": 0})
+                def generate(prompt):
+                    return client.models.generate_content(
+                        model=model_name, contents=prompt, config={"temperature": 0}).text
 
-                results = experiment.run_full_pipeline(
-                    data, chunks, GeminiModel(), bm25, collection, reranker,
-                    rounds=args.rounds, alpha=args.alpha, threshold=args.threshold)
-                for name, table in results.items():
-                    table.to_csv(output / f"{name}.csv", index=False)
+                retriever = experiment.Retriever(chunks, bm25, collection, reranker, args.alpha)
+                experiment.run_full_pipeline(data, retriever, generate, output,
+                    rounds=args.rounds, threshold=args.threshold, sleep=args.sleep)
         settings["status"] = "completed"
     except Exception as error:
         settings.update(status="failed", error_type=type(error).__name__)

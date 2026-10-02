@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import numpy as np
 from rank_bm25 import BM25Okapi
@@ -36,14 +35,13 @@ class ExperimentTests(unittest.TestCase):
             def predict(self, pairs):
                 return np.arange(len(pairs), 0, -1)
 
-        class Model:
-            def generate_content(self, prompt):
-                prompts.append(prompt)
-                return SimpleNamespace(text="Answer: A\nSource: rare evidence")
+        def generate(prompt):
+            prompts.append(prompt)
+            return "Answer: A\nSource: rare evidence"
 
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(experiment, "OUTPUT_DIR", Path(directory)), patch.object(experiment, "SLEEP_SECONDS", 0):
-                results = experiment.run_full_pipeline(data, chunks, Model(), bm25, Collection(), Reranker())
+            retriever = experiment.Retriever(chunks, bm25, Collection(), Reranker())
+            results = experiment.run_full_pipeline(data, retriever, generate, Path(directory), sleep=0)
             self.assertEqual(len(prompts), 4)
             self.assertTrue(all(size <= len(chunks) for size in queries))
             self.assertNotIn("CONTEXT:", prompts[0])
@@ -52,18 +50,16 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual(results["source"]["source_accuracy"].tolist(), [100.0] * 3)
             self.assertTrue((results["recall"][["BM25", "Dense", "Hybrid"]] == "100.0%").all().all())
             self.assertEqual(len(list(Path(directory).glob("*.png"))), 4)
-            self.assertTrue((Path(directory) / "CONCLUSIONES_PIPELINE.txt").exists())
+            self.assertEqual(len(list(Path(directory).glob("*.csv"))), 4)
 
     def test_api_failures_do_not_become_zero_accuracy(self):
-        class BrokenModel:
-            def generate_content(self, prompt):
-                raise ConnectionError("test failure")
+        def broken_generate(prompt):
+            raise ConnectionError("test failure")
         with self.assertRaises(RuntimeError):
-            experiment.call_gemini(BrokenModel(), "test", max_retries=2, sleep=0)
+            experiment.call_gemini(broken_generate, "test", max_retries=2, sleep=0)
 
     def test_empty_response_is_an_abstention(self):
-        model = SimpleNamespace(generate_content=lambda prompt: SimpleNamespace(text=None))
-        self.assertEqual(experiment.call_gemini(model, "test", sleep=0), "")
+        self.assertEqual(experiment.call_gemini(lambda prompt: None, "test", sleep=0), "")
 
     def test_recall_respects_the_requested_threshold(self):
         chunks = ["rare evidence", "other words"]
@@ -71,9 +67,29 @@ class ExperimentTests(unittest.TestCase):
         bm25 = BM25Okapi([better_tokenize(chunk) for chunk in chunks])
         collection = SimpleNamespace(query=lambda **kwargs: {
             "ids": [["0", "1"]], "documents": [chunks], "distances": [[0.0, 1.0]]})
-        result = experiment.calculate_recall_metrics_complete(
-            data, chunks, bm25, collection, k_values=[2], threshold=1.0)
+        retriever = experiment.Retriever(chunks, bm25, collection)
+        result = experiment.evaluate_recall(data, retriever, k_values=[2], threshold=1.0)
         self.assertEqual(result.iloc[0]["Dense"], "0.0%")
+
+    def test_hybrid_weights_and_stable_ties(self):
+        chunks = ["lexical", "semantic", "both"]
+        bm25 = SimpleNamespace(get_scores=lambda tokens: np.array([4.0, 0.0, 2.0]))
+        collection = SimpleNamespace(query=lambda **kwargs: {
+            "ids": [["1", "2", "0"]], "documents": [[chunks[1], chunks[2], chunks[0]]],
+            "distances": [[0.0, 0.4, 1.0]]})
+        for alpha, expected in [(0, ["lexical", "both", "semantic"]),
+                                (0.5, ["both", "semantic", "lexical"]),
+                                (1, ["semantic", "both", "lexical"])]:
+            with self.subTest(alpha=alpha):
+                retriever = experiment.Retriever(chunks, bm25, collection, alpha=alpha)
+                self.assertEqual(retriever.retrieve("query", "hybrid", rerank=False), expected)
+
+    def test_reranking_reorders_dense_candidates(self):
+        collection = SimpleNamespace(query=lambda **kwargs: {
+            "documents": [["first", "second", "third"]]})
+        reranker = SimpleNamespace(predict=lambda pairs: np.array([0.1, 0.9, 0.4]))
+        retriever = experiment.Retriever(["first", "second", "third"], None, collection, reranker)
+        self.assertEqual(retriever.retrieve("query", "dense", top_k=2), ["second", "third"])
 
 
 if __name__ == "__main__":

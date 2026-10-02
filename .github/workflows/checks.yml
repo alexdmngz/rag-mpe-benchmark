@@ -17,5 +17,5 @@ jobs:
           cache-dependency-path: requirements-check.txt
       - run: python -m pip install -r requirements-check.txt
       - run: python -m unittest discover -s tests -v
-      - run: python src/Script.py --mode prepare
-      - run: python src/Script.py --mode bm25 --limit 3
+      - run: python src/main.py --mode prepare
+      - run: python src/main.py --mode bm25 --limit 3
