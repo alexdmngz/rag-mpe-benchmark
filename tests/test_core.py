@@ -71,6 +71,8 @@ class CoreTests(unittest.TestCase):
         for text, answer in [("A", "A"), ("Reasoning: data\nAnswer: c\nSource: Appendix D", "C"),
                              ("Answer: N/A\nSource: A and B", "N/A"),
                              ("See Appendix D", "N/A"), ("Answer: Definitely B", "N/A"),
+                             ("Answer: A\nAnswer: B", "N/A"),
+                             ("Answer: A\nAnswer: a", "A"),
                              ("", "N/A")]:
             with self.subTest(text=text):
                 self.assertEqual(parse_mc_answer(text), answer)
@@ -103,6 +105,15 @@ class CoreTests(unittest.TestCase):
             repeated = subprocess.run(command, cwd=directory, capture_output=True, text=True)
             self.assertNotEqual(repeated.returncode, 0)
             self.assertIn("not empty", repeated.stderr)
+
+    def test_cli_missing_input_has_a_readable_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = [sys.executable, str(ROOT / "src/main.py"),
+                       "--data", str(Path(directory) / "missing.json")]
+            completed = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("Error:", completed.stderr)
+            self.assertNotIn("Traceback", completed.stderr)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Data validation and text helpers. This module needs only Python itself."""
+"""Dataset validation, chunking and evaluation helpers."""
 
 import json
 import re
@@ -125,18 +125,16 @@ def normalize_scores(scores):
     maximum = max(scores)
     if maximum == minimum:
         return [1.0] * len(scores)
-    normalized = []
-    for score in scores:
-        normalized.append((score - minimum) / (maximum - minimum))
-    return normalized
+    return [(score - minimum) / (maximum - minimum) for score in scores]
 
 
 def parse_mc_answer(text_response):
     """Accept an explicit answer or a bare letter, never a letter in a citation."""
     text = (text_response or "").strip()
-    match = re.search(r"^\s*Answer:\s*([A-D]|N/A)[.)]?\s*$", text, re.IGNORECASE | re.MULTILINE)
-    if match:
-        return match.group(1).upper()
+    matches = re.findall(r"^\s*Answer:\s*([A-D]|N/A)[.)]?\s*$", text, re.IGNORECASE | re.MULTILINE)
+    if matches:
+        answers = {answer.upper() for answer in matches}
+        return answers.pop() if len(answers) == 1 else "N/A"
     answer = text.upper()
     if answer in ("A", "B", "C", "D", "N/A"):
         return answer
@@ -146,15 +144,11 @@ def parse_mc_answer(text_response):
 def compute_accuracy(model_answers, true_answers):
     if len(model_answers) != len(true_answers):
         raise ValueError("Predictions and labels must have equal lengths.")
-    mistakes = []
-    for index in range(len(true_answers)):
-        if model_answers[index] != true_answers[index]:
-            mistakes.append(index + 1)
+    mistakes = [index for index, (prediction, label) in
+                enumerate(zip(model_answers, true_answers), 1) if prediction != label]
     total = len(true_answers)
     correct = total - len(mistakes)
-    accuracy = 0.0
-    if total > 0:
-        accuracy = 100 * correct / total
+    accuracy = 100 * correct / total if total else 0.0
     return accuracy, correct, total, mistakes
 
 
@@ -163,9 +157,6 @@ def check_fuzzy_attribution(retrieved_context, reference, threshold=0.75):
     context_words = set(better_tokenize(retrieved_context))
     if not reference_words or not context_words:
         return False, 0.0
-    matches = 0
-    for word in reference_words:
-        if word in context_words:
-            matches += 1
+    matches = sum(word in context_words for word in reference_words)
     score = matches / len(reference_words)
     return score >= threshold, score

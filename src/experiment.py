@@ -1,5 +1,6 @@
 """Shared retrieval, evaluation and plotting for the four experiment methods."""
 
+import json
 import time
 import uuid
 
@@ -21,7 +22,7 @@ METHODS = ("bm25", "dense", "hybrid")
 
 
 class Retriever:
-    """Keep the indexes together and use one retrieval path for every metric."""
+    """BM25, dense and hybrid search over the same chunks."""
 
     def __init__(self, chunks, bm25, collection=None, reranker=None, alpha=0.5):
         self.chunks = chunks
@@ -38,10 +39,7 @@ class Retriever:
         if method == "bm25":
             return self.bm25.get_top_n(tokens, self.chunks, n=top_k)
 
-        if method == "dense":
-            pool = dense_pool
-        else:
-            pool = hybrid_dense_pool
+        pool = dense_pool if method == "dense" else hybrid_dense_pool
         result = self.collection.query(
             query_texts=[question], n_results=min(pool, len(self.chunks))
         )
@@ -58,45 +56,28 @@ class Retriever:
     def combine_scores(self, tokens, dense_result):
         """Add the weighted dense and BM25 scores for each chunk."""
         # Chroma returns distances: smaller distances mean better matches.
-        similarities = []
-        for distance in dense_result["distances"][0]:
-            similarities.append(1 - distance)
+        similarities = [1 - distance for distance in dense_result["distances"][0]]
         dense_scores = normalize_scores(similarities)
 
-        combined_scores = {}
-        for chunk_id, score in zip(dense_result["ids"][0], dense_scores):
-            combined_scores[int(chunk_id)] = self.alpha * score
+        combined_scores = {int(chunk_id): self.alpha * score
+                           for chunk_id, score in zip(dense_result["ids"][0], dense_scores)}
 
         bm25_scores = self.bm25.get_scores(tokens)
-        # argsort gives positions from lowest to highest score; reverse them.
         bm25_ids = np.argsort(bm25_scores)[::-1][:50]
-        top_scores = []
-        for chunk_id in bm25_ids:
-            top_scores.append(bm25_scores[chunk_id])
-        normalized_bm25 = normalize_scores(top_scores)
+        normalized_bm25 = normalize_scores(bm25_scores[bm25_ids])
 
         for chunk_id, score in zip(bm25_ids, normalized_bm25):
-            if chunk_id not in combined_scores:
-                combined_scores[chunk_id] = 0
-            combined_scores[chunk_id] += (1 - self.alpha) * score
+            combined_scores[chunk_id] = combined_scores.get(chunk_id, 0) + (1 - self.alpha) * score
 
         ordered_ids = sorted(combined_scores, key=combined_scores.get, reverse=True)
-        candidates = []
-        for chunk_id in ordered_ids:
-            candidates.append(self.chunks[chunk_id])
-        return candidates
+        return [self.chunks[chunk_id] for chunk_id in ordered_ids]
 
     def rerank_candidates(self, question, candidates):
-        pairs = []
-        for chunk in candidates:
-            pairs.append([question, chunk])
+        pairs = [[question, chunk] for chunk in candidates]
         scores = self.reranker.predict(pairs)
         ordered_ids = np.argsort(scores)[::-1]
 
-        ranked_chunks = []
-        for chunk_id in ordered_ids:
-            ranked_chunks.append(candidates[chunk_id])
-        return ranked_chunks
+        return [candidates[chunk_id] for chunk_id in ordered_ids]
 
 
 def build_vector_collection(chunks):
@@ -186,24 +167,34 @@ def call_gemini(generate, prompt, max_retries=3, sleep=5):
             print(f"Gemini request failed ({type(error).__name__}); retrying.")
             time.sleep(sleep * (attempt + 1))
         else:
-            time.sleep(sleep)
             return text
 
 
-def evaluate_accuracy(data, retriever, generate, rounds=1, sleep=5):
+def evaluate_accuracy(data, retriever, generate, rounds=1, sleep=5, prediction_log=None):
     rows = []
     labels = [item["correct_answer"] for item in data]
     for round_number in range(1, rounds + 1):
         for method in ("baseline", "bm25", "dense", "hybrid"):
             predictions = []
-            for item in data:
+            for number, item in enumerate(data, 1):
                 context = ""
                 if method != "baseline":
                     chunks = retriever.retrieve(item["question"], method)
                     context = "\n---\n".join(chunks)
                 prompt = build_prompt(item, method, context)
                 response = call_gemini(generate, prompt, sleep=sleep)
-                predictions.append(parse_mc_answer(response))
+                prediction = parse_mc_answer(response)
+                predictions.append(prediction)
+                if prediction_log is not None:
+                    record = {
+                        "round": round_number, "method": method, "question_number": number,
+                        "question": item["question"], "prompt": prompt, "response": response,
+                        "prediction": prediction, "correct_answer": item["correct_answer"],
+                        "correct": prediction == item["correct_answer"],
+                    }
+                    prediction_log.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    prediction_log.flush()
+                time.sleep(sleep)
             accuracy, correct, total, mistakes = compute_accuracy(predictions, labels)
             rows.append({"round": round_number, "method": method, "accuracy": accuracy})
             print(f"Round {round_number}, {method}: {correct}/{total} ({accuracy:.2f}%); mistakes: {mistakes}")
@@ -227,11 +218,7 @@ def evaluate_sources(data, retriever, threshold=0.75):
 
 
 def evaluate_recall(data, retriever, threshold=0.75, k_values=(1, 3, 5, 10)):
-    hits = {}
-    for method in METHODS:
-        hits[method] = {}
-        for k in k_values:
-            hits[method][k] = 0
+    hits = {method: dict.fromkeys(k_values, 0) for method in METHODS}
     for item in data:
         for method in METHODS:
             chunks = retriever.retrieve(item["question"], method, top_k=max(k_values),
@@ -328,13 +315,18 @@ def plot_results(results, output):
 
 def run_full_pipeline(data, retriever, generate, output, rounds=1, threshold=0.75, sleep=5):
     output.mkdir(parents=True, exist_ok=True)
-    results = {
-        "accuracy": evaluate_accuracy(data, retriever, generate, rounds, sleep),
-        "source": evaluate_sources(data, retriever, threshold),
-        "recall": evaluate_recall(data, retriever, threshold),
-        "overhead": evaluate_overhead(data, retriever),
+    with (output / "predictions.jsonl").open("x", encoding="utf-8") as log:
+        accuracy = evaluate_accuracy(data, retriever, generate, rounds, sleep, log)
+    results = {}
+    evaluations = {
+        "accuracy": lambda: accuracy,
+        "source": lambda: evaluate_sources(data, retriever, threshold),
+        "recall": lambda: evaluate_recall(data, retriever, threshold),
+        "overhead": lambda: evaluate_overhead(data, retriever),
     }
-    for name, table in results.items():
+    for name, evaluate in evaluations.items():
+        table = evaluate()
+        results[name] = table
         table.to_csv(output / f"{name}.csv", index=False)
         print(f"\n{name}\n{table.to_string(index=False)}")
     plot_results(results, output)

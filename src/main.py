@@ -77,7 +77,6 @@ def build_run_info(args, output, timestamp, model_name, dataset_count, data, chu
     settings["python"] = platform.python_version()
     settings["status"] = "prepared"
 
-    # Hashes tell us whether two runs used exactly the same input files.
     settings["input_sha256"] = {}
     for name, path in (("data", args.data), ("paper", args.paper)):
         file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -142,7 +141,6 @@ def run_gemini(data, chunks, bm25, output, args, api_key, model_name):
     retriever = experiment.Retriever(chunks, bm25, collection, reranker, args.alpha)
 
     with genai.Client(api_key=api_key) as client:
-        # This small function lets the evaluation loop also run with a test model.
         def generate(prompt):
             response = client.models.generate_content(
                 model=model_name, contents=prompt, config={"temperature": 0}
@@ -160,7 +158,6 @@ def main(argv=None):
     args = parser.parse_args(argv)
     validate_arguments(args, parser)
 
-    # 1. Read the questions and split the paper into searchable chunks.
     data = load_data(args.data)
     dataset_count = len(data)
     if args.limit is not None:
@@ -181,7 +178,6 @@ def main(argv=None):
         if not api_key or api_key == "YOUR_API_KEY_HERE" or not model_name:
             parser.error("full mode requires GEMINI_API_KEY and GEMINI_MODEL (or --model)")
 
-    # 2. Save the prepared inputs in a new output directory.
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = args.output
     if output is None:
@@ -199,7 +195,6 @@ def main(argv=None):
         print(f"Preparation complete (no network or model calls): {output}")
         return output
 
-    # 3. Run the selected experiment and record whether it completed.
     try:
         from rank_bm25 import BM25Okapi
         tokenized_chunks = [better_tokenize(chunk) for chunk in chunks]
@@ -209,8 +204,8 @@ def main(argv=None):
         else:
             run_gemini(data, chunks, bm25, output, args, api_key, model_name)
         settings["status"] = "completed"
-    except Exception as error:
-        settings["status"] = "failed"
+    except (Exception, KeyboardInterrupt) as error:
+        settings["status"] = "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
         settings["error_type"] = type(error).__name__
         raise
     finally:
@@ -220,4 +215,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (ValueError, OSError, ImportError, RuntimeError) as error:
+        raise SystemExit(f"Error: {error}") from None
+    except KeyboardInterrupt:
+        raise SystemExit("Run interrupted.") from None

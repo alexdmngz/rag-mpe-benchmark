@@ -1,9 +1,11 @@
 """Check the pipeline with simple fake models; no network or API key is needed."""
 
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import numpy as np
 from rank_bm25 import BM25Okapi
@@ -79,6 +81,52 @@ class ExperimentTests(unittest.TestCase):
                 self.assertEqual(results["recall"][method].tolist(), ["100.0%"] * 4)
             self.assertEqual(len(list(output.glob("*.png"))), 4)
             self.assertEqual(len(list(output.glob("*.csv"))), 4)
+            records = [json.loads(line) for line in (output / "predictions.jsonl").read_text().splitlines()]
+            self.assertEqual([row["method"] for row in records], ["baseline", "bm25", "dense", "hybrid"])
+            self.assertEqual([row["prompt"] for row in records], prompts)
+            self.assertTrue(all(row["correct"] for row in records))
+            self.assertTrue(all(row["response"] == "Answer: A\nSource: rare evidence" for row in records))
+
+    def test_failed_run_keeps_completed_predictions(self):
+        data = [{"question": "Question", "answers": dict.fromkeys("ABCD", "Option"),
+                 "correct_answer": "A", "paper_reference": "Evidence"}]
+        retriever = Mock()
+        retriever.retrieve.return_value = ["Evidence"]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with patch("experiment.call_gemini", side_effect=["A", RuntimeError("Unavailable")]):
+                with self.assertRaises(RuntimeError):
+                    experiment.run_full_pipeline(data, retriever, None, output, sleep=0)
+            records = [json.loads(line) for line in (output / "predictions.jsonl").read_text().splitlines()]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["prediction"], "A")
+            self.assertEqual(records[0]["method"], "baseline")
+            with self.assertRaises(FileExistsError):
+                experiment.run_full_pipeline(data, retriever, None, output, sleep=0)
+
+    def test_completed_tables_survive_a_later_metric_failure(self):
+        data = [{"question": "Question", "answers": dict.fromkeys("ABCD", "Option"),
+                 "correct_answer": "A", "paper_reference": "Evidence"}]
+        retriever = Mock()
+        retriever.retrieve.return_value = ["Evidence"]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with patch("experiment.evaluate_sources", side_effect=RuntimeError("Search failed")):
+                with self.assertRaises(RuntimeError):
+                    experiment.run_full_pipeline(data, retriever, lambda _: "A", output, sleep=0)
+            self.assertTrue((output / "accuracy.csv").exists())
+            self.assertEqual(len((output / "predictions.jsonl").read_text().splitlines()), 4)
+
+    def test_interrupting_the_pause_preserves_the_response(self):
+        data = [{"question": "Question", "answers": dict.fromkeys("ABCD", "Option"),
+                 "correct_answer": "A", "paper_reference": "Evidence"}]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with patch("experiment.time.sleep", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    experiment.run_full_pipeline(data, None, lambda _: "A", output)
+            record = json.loads((output / "predictions.jsonl").read_text())
+            self.assertEqual(record["response"], "A")
 
     def test_api_failures_do_not_become_zero_accuracy(self):
         def broken_generate(prompt):
